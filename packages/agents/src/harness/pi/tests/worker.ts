@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   fauxAssistantMessage,
   fauxProvider,
@@ -16,6 +17,7 @@ import {
   createRegistry,
   defineSignal,
   defineTask,
+  GenerationTask,
   hook,
   SubmissionSettled,
   ToolTask,
@@ -42,6 +44,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Lifecycle } from "../../../lifecycle";
 import { LiveInstances } from "../../../tests/shared/live-instances";
 import { setWakeTimingForTests } from "../harness";
+import { openPiSessionStore } from "../session-store";
 import { TEST_TIMING } from "./timing";
 import { fauxModels, TEST_SETTINGS } from "./faux";
 import {
@@ -337,27 +340,47 @@ function entryTexts(entries: readonly EntryRecord[]): string[] {
   });
 }
 
-/**
- * pi's storage, failing the next commit with `faults.commit` when one is
- * set, as a lost disk would. Any error a Storage commit throws fails pi's
- * Session for good.
- */
-function withCommitFault(
+type StorageFaults = { commit?: Error; close?: Error };
+
+/** One-shot storage faults on a real SQLite backend. */
+function withStorageFaults(
   storage: SqliteStorage,
-  faults: { commit?: Error }
+  faults: StorageFaults
 ): SqliteStorage {
   return new Proxy(storage, {
     get(target, key) {
       const value: unknown = Reflect.get(target, key, target);
       if (typeof value !== "function") return value;
-      if (key !== "commit") return value.bind(target);
-      return (...args: Parameters<SqliteStorage["commit"]>) => {
-        const error = faults.commit;
-        faults.commit = undefined;
-        return error ? Promise.reject(error) : target.commit(...args);
-      };
+      if (key === "close") {
+        return async (...args: Parameters<SqliteStorage["close"]>) => {
+          const error = faults.close;
+          faults.close = undefined;
+          await target.close(...args);
+          if (error) throw error;
+        };
+      }
+      if (key === "commit") {
+        return (...args: Parameters<SqliteStorage["commit"]>) => {
+          const error = faults.commit;
+          faults.commit = undefined;
+          return error ? Promise.reject(error) : target.commit(...args);
+        };
+      }
+      return value.bind(target);
     }
   });
+}
+
+async function closeWithStorageError(
+  harness: PiHarness,
+  faults: StorageFaults
+): Promise<string | undefined> {
+  faults.close = new Error("injected Pi storage close failure");
+  try {
+    await harness.dispose();
+  } catch (error) {
+    return String(error);
+  }
 }
 
 /** Every {@link PiHarnessTestObject} harness, by object name. */
@@ -369,7 +392,7 @@ export class PiHarnessTestObject extends DurableObject<Cloudflare.Env> {
     tokensPerSecond: 200,
     tokenSize: { min: 2, max: 4 }
   });
-  readonly #faults: { commit?: Error } = {};
+  readonly #faults: StorageFaults = {};
   readonly registry = createRegistry();
   readonly harness = new PiHarness({
     harness: async ({ storage, context, onWake }) => {
@@ -377,7 +400,7 @@ export class PiHarnessTestObject extends DurableObject<Cloudflare.Env> {
       const name = this.ctx.id.name ?? "";
       return this.#observe(
         await Harness.open(
-          withCommitFault(storage, this.#faults),
+          withStorageFaults(storage, this.#faults),
           {
             models: fauxModels(this.#faux.provider),
             registry: this.registry,
@@ -780,6 +803,10 @@ export class PiHarnessTestObject extends DurableObject<Cloudflare.Env> {
   /** Close pi's in-memory resources, as the host does on shutdown. */
   async dispose(): Promise<void> {
     await this.harness.dispose();
+  }
+
+  disposeThroughStorageError(): Promise<string | undefined> {
+    return closeWithStorageError(this.harness, this.#faults);
   }
 
   async abort(operationId?: string): Promise<boolean> {
@@ -1246,3 +1273,422 @@ export {
 export { PiWireTestObject } from "./wire-fixture";
 
 export default { fetch: () => new Response("Not found", { status: 404 }) };
+
+// The self-RPC tests have their own host hooks and tracing instrumentation.
+// The legacy fixture above keeps its original startup and alarm behavior.
+const RestartOnlyReminder = defineTask<null, { phase: "wait" }, null>({
+  name: "test.restart-only-reminder",
+  version: 1,
+  initial: () => ({ phase: "wait" }),
+  phases: {
+    wait: async (_task, runtime, context) => {
+      await runtime.commit(
+        () => ({
+          status: "sleeping",
+          checkpoint: { phase: "wait" },
+          signals: [Approval.key("reminder")]
+        }),
+        context
+      );
+    }
+  },
+  abort: async (_task, runtime, context) => {
+    await runtime.commit(
+      () => ({ status: "terminal", outcome: { status: "aborted" } }),
+      context
+    );
+  }
+});
+
+export class PiRpcHarnessTestObject extends DurableObject<Cloudflare.Env> {
+  readonly #mode = this.ctx.id.name?.split(":")[0];
+  readonly #faux = fauxProvider({
+    tokensPerSecond: 200,
+    tokenSize: { min: 2, max: 4 }
+  });
+  readonly #faults: StorageFaults = {};
+  readonly #scope = new AsyncLocalStorage<{ token: string; active: boolean }>();
+  readonly #phases: {
+    phase: "model" | "tool";
+    boundary: "start" | "end";
+    token: string | undefined;
+    receiverActive: boolean;
+  }[] = [];
+  readonly #failed: string[] = [];
+  #failNext: "before-entry" | "drop-before-entry" | "after-entry" | undefined;
+  #rejectSender: (() => void) | undefined;
+  #releaseHold: (() => void) | undefined;
+  #holdFinishedInReceiver: boolean | undefined;
+  #startupWaitError: string | undefined;
+  #startupReceipt: PiReceipt | undefined;
+  #startupAbortResult:
+    | {
+        empty: boolean | string;
+        whole: boolean | string;
+        placed: boolean | string;
+        queued: boolean | string;
+      }
+    | undefined;
+
+  readonly harness = new PiHarness({
+    runInRpc: (token) => {
+      const stub = this.env.PI_RPC_HARNESS_TEST.get(this.ctx.id);
+      const failure = this.#failNext;
+      this.#failNext = undefined;
+      if (failure === "before-entry") {
+        this.#failed.push(token);
+        return stub.failPiWork();
+      }
+      if (failure === "drop-before-entry") {
+        this.#failed.push(token);
+        return new Promise<void>(() => {});
+      }
+      const work = stub.runPiWork(token);
+      this.ctx.waitUntil(work.catch(() => {}));
+      if (failure !== "after-entry") return work;
+      return Promise.race([
+        work,
+        new Promise<void>((_, reject) => {
+          this.#rejectSender = () =>
+            reject(new Error("injected loss of the Pi RPC acknowledgement"));
+        })
+      ]);
+    },
+    harness: ({ storage, context, onWake, schedule }) => {
+      const registry = createRegistry();
+      registry.install(this.#tools());
+      const options = {
+        registry,
+        models: fauxModels(this.#faux.provider),
+        settings: TEST_SETTINGS,
+        onWake,
+        ...(this.#mode === "missing-hook" ? {} : { schedule })
+      };
+      return Harness.open(
+        withStorageFaults(storage, this.#faults),
+        options,
+        context
+      );
+    },
+    defaults: { model: this.#faux.getModel() }
+  });
+  readonly lifecycle = Lifecycle.install(this).use(this.harness);
+
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    setWakeTimingForTests(this.harness, TEST_TIMING);
+    this.#faux.setResponses(
+      Array.from(
+        { length: 20 },
+        () => (context: TranscriptContext) => script(context, ctx.storage)
+      )
+    );
+  }
+
+  #tools(): Extension {
+    const hold: ToolRegistration<typeof NoParameters> = {
+      name: "hold",
+      description: "Wait in memory until released.",
+      parameters: NoParameters,
+      replay: "safe",
+      execute: async () => {
+        await new Promise<void>((resolve) => {
+          this.#releaseHold = resolve;
+        });
+        this.#holdFinishedInReceiver = this.#scope.getStore()?.active ?? false;
+        return { output: [{ type: "text", text: "released" }] };
+      }
+    };
+    const gate: ToolRegistration<typeof NoParameters> = {
+      name: "gate",
+      description: "Wait until a durable release.",
+      parameters: NoParameters,
+      replay: "safe",
+      execute: async (_args, _api, context) => {
+        this.ctx.storage.kv.put(GATE_RUNS_KEY, true);
+        while (!this.ctx.storage.kv.get(RELEASE_KEY)) {
+          context.abortSignal?.throwIfAborted();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        return { output: [{ type: "text", text: "released" }] };
+      }
+    };
+    return {
+      name: "execution-rpc-test",
+      hooks: [
+        hook(GenerationTask, {
+          beforeRequest: () => {
+            this.#recordPhase("model", "start");
+            return undefined;
+          },
+          afterResponse: () => this.#recordPhase("model", "end")
+        }),
+        hook(ToolTask, {
+          beforeTool: () => {
+            this.#recordPhase("tool", "start");
+            return undefined;
+          },
+          afterTool: () => {
+            this.#recordPhase("tool", "end");
+            return undefined;
+          }
+        })
+      ],
+      tasks: [Reminder, RestartOnlyReminder],
+      tools: [multiplyTool(), hold, gate]
+    };
+  }
+
+  #recordPhase(phase: "model" | "tool", boundary: "start" | "end"): void {
+    const receiver = this.#scope.getStore();
+    this.#phases.push({
+      phase,
+      boundary,
+      token: receiver?.token,
+      receiverActive: receiver?.active ?? false
+    });
+  }
+
+  async onStart(): Promise<void> {
+    if (this.#mode === "startup-abort") {
+      await this.#abortDuringStartup();
+      return;
+    }
+    if (this.#mode !== "startup") return;
+    try {
+      await this.harness.prompt("must not be admitted");
+    } catch (error) {
+      this.#startupWaitError = String(error);
+    }
+    this.#startupReceipt = await this.harness.submit("from startup");
+  }
+
+  async #abortDuringStartup(): Promise<void> {
+    const capture = async (operationId?: string): Promise<boolean | string> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          this.harness.abort({ operationId }),
+          new Promise<string>((resolve) => {
+            timer = setTimeout(() => resolve("startup abort timed out"), 1_000);
+          })
+        ]);
+      } catch (error) {
+        return String(error);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const empty = await capture();
+    await this.harness.submit("first", { operationId: "placed" });
+    await this.harness.submit("second", { operationId: "queued" });
+    this.#startupAbortResult = {
+      empty,
+      whole: await capture(),
+      placed: await capture("placed"),
+      queued: await capture("queued")
+    };
+  }
+
+  async onAlarm(): Promise<void> {
+    const prompt = this.ctx.storage.kv.get<string>("test:rpc-alarm-armed");
+    if (!prompt) return;
+    this.ctx.storage.kv.delete("test:rpc-alarm-armed");
+    if (prompt === "gate") {
+      await this.harness.submit(prompt);
+    } else {
+      const result = await this.harness.prompt(prompt);
+      this.ctx.storage.kv.put("test:rpc-alarm-result", result.text);
+    }
+  }
+
+  /** Probe Pi directly, so a PiHarness regression cannot turn into a skip. */
+  async piSupportsSchedule(): Promise<boolean> {
+    let scheduled = false;
+    const storage = await openPiSessionStore(this.ctx.storage);
+    const options = {
+      registry: createRegistry(),
+      models: fauxModels(this.#faux.provider),
+      schedule: () => {
+        scheduled = true;
+      }
+    };
+    const pi = await Harness.open(storage, options, BACKGROUND_CONTEXT);
+    try {
+      pi.resume();
+      return scheduled;
+    } finally {
+      await pi.close(BACKGROUND_CONTEXT);
+    }
+  }
+
+  async rpcStartupError(): Promise<string | undefined> {
+    try {
+      await this.lifecycle.start();
+    } catch (error) {
+      return String(error);
+    }
+  }
+
+  rpcStartup() {
+    return { error: this.#startupWaitError, receipt: this.#startupReceipt };
+  }
+
+  rpcStartupAborts() {
+    return this.#startupAbortResult;
+  }
+
+  async armRpcAlarmPrompt(prompt = "from onAlarm"): Promise<void> {
+    this.ctx.storage.kv.put("test:rpc-alarm-armed", prompt);
+    await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  rpcAlarmResult(): string | undefined {
+    return this.ctx.storage.kv.get<string>("test:rpc-alarm-result");
+  }
+
+  async runPiWork(token: string): Promise<void> {
+    const receiver = { token, active: true };
+    try {
+      await this.#scope.run(receiver, () =>
+        this.harness.runScheduledWork(token)
+      );
+    } finally {
+      receiver.active = false;
+    }
+  }
+
+  async failPiWork(): Promise<void> {
+    throw new Error("injected failure before Pi RPC entry");
+  }
+
+  failNextPiWork(
+    when: "before-entry" | "drop-before-entry" | "after-entry" = "before-entry"
+  ): void {
+    this.#failNext = when;
+  }
+
+  rejectPiWorkSender(): void {
+    const reject = this.#rejectSender;
+    if (!reject) throw new Error("No active Pi RPC sender to reject");
+    this.#rejectSender = undefined;
+    reject();
+  }
+
+  rpcPhases() {
+    return this.#phases;
+  }
+
+  rpcFailures() {
+    return this.#failed;
+  }
+
+  async createSession(): Promise<string> {
+    return (await this.harness.sessions.create()).id;
+  }
+
+  submit(text: string, options: { session?: string } = {}): Promise<PiReceipt> {
+    return this.harness.submit(text, options);
+  }
+
+  wait(operationId: string, session?: string): Promise<PiOperationResult> {
+    return this.harness.wait(operationId, session ? { session } : {});
+  }
+
+  alarmTime(): Promise<number | null> {
+    return this.ctx.storage.getAlarm();
+  }
+
+  holding(): boolean {
+    return this.#releaseHold !== undefined;
+  }
+
+  releaseHold(): void {
+    const release = this.#releaseHold;
+    this.#releaseHold = undefined;
+    release?.();
+  }
+
+  gateStarted(): boolean {
+    return this.ctx.storage.kv.get<boolean>(GATE_RUNS_KEY) ?? false;
+  }
+
+  release(): void {
+    this.ctx.storage.kv.put(RELEASE_KEY, true);
+  }
+
+  seedMemoryLimitStrikes(): void {
+    this.ctx.storage.kv.put(STRIKES_KEY, 2);
+  }
+
+  memoryLimitStrikes(): number {
+    return this.ctx.storage.kv.get<number>(STRIKES_KEY) ?? 0;
+  }
+
+  async remindAt(until: number): Promise<void> {
+    const root = await this.harness.conversation("1");
+    await root.commit(
+      (tx) =>
+        tx.createTask(
+          Reminder,
+          { until },
+          {
+            ownership: { kind: "conversation" },
+            background: true
+          }
+        ),
+      BACKGROUND_CONTEXT
+    );
+  }
+
+  async liveReminders(): Promise<number> {
+    const pi = await this.harness.pi();
+    return (await pi.inspect(BACKGROUND_CONTEXT)).tasks.filter(
+      ({ record }) => record.kind === Reminder.definition.name
+    ).length;
+  }
+
+  async restartOnlyReminder(): Promise<number> {
+    const root = await this.harness.conversation("1");
+    return root.commit(
+      (tx) =>
+        tx.createTask(RestartOnlyReminder, null, {
+          ownership: { kind: "conversation" },
+          abandonOnRestart: true
+        }),
+      BACKGROUND_CONTEXT
+    );
+  }
+
+  async reminderState(id: number): Promise<string | undefined> {
+    const pi = await this.harness.pi();
+    const task = await pi.getTask(id as TaskId<null>, BACKGROUND_CONTEXT);
+    return task?.state.status === "terminal"
+      ? task.state.outcome.status
+      : task?.state.status;
+  }
+
+  dispose(): Promise<void> {
+    return this.harness.dispose();
+  }
+
+  async disposeHeldTool(): Promise<boolean | undefined> {
+    const pi = await this.harness.pi();
+    const started = new Promise<void>((resolve) => pi.subscribeClose(resolve));
+    const closing = this.harness.dispose();
+    await started;
+    // Let the receiver observe that Pi began closing before the tool ends.
+    await scheduler.wait(0);
+    this.releaseHold();
+    await closing;
+    return this.#holdFinishedInReceiver;
+  }
+
+  disposeThroughStorageError(): Promise<string | undefined> {
+    return closeWithStorageError(this.harness, this.#faults);
+  }
+
+  async reopen(): Promise<void> {
+    await this.harness.pi();
+  }
+}

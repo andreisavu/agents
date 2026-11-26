@@ -5,6 +5,7 @@
   "durable_objects": {
     "bindings": [
       { "name": "PI_HARNESS_TEST", "class_name": "PiHarnessTestObject" },
+      { "name": "PI_RPC_HARNESS_TEST", "class_name": "PiRpcHarnessTestObject" },
       { "name": "PI_STORE_TEST", "class_name": "PiStoreTestObject" },
       { "name": "PI_NO_DEFAULTS_TEST", "class_name": "PiNoDefaultsTestObject" },
       { "name": "PI_FACTORY_TEST", "class_name": "PiFactoryTestObject" },
@@ -28,6 +29,7 @@
       "tag": "v1",
       "new_sqlite_classes": [
         "PiHarnessTestObject",
+        "PiRpcHarnessTestObject",
         "PiStoreTestObject",
         "PiNoDefaultsTestObject",
         "PiFactoryTestObject",
