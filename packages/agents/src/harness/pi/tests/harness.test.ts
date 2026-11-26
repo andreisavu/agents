@@ -924,6 +924,20 @@ describe("PiHarness on pi-durable", () => {
     ]);
   });
 
+  it("reopens pi after dispose reports a storage close failure", async () => {
+    const stub = fresh();
+    expect((await stub.prompt("hello")).text).toBe("echo: hello");
+    expect(await stub.disposeThroughStorageError()).toContain(
+      "injected Pi storage close failure"
+    );
+    expect((await stub.prompt("again")).messages).toEqual([
+      "hello",
+      "echo: hello",
+      "again",
+      "echo: again"
+    ]);
+  });
+
   it("keeps sessions separate", async () => {
     const stub = fresh();
     const other = await stub.createSession();

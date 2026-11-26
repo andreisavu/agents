@@ -58,16 +58,56 @@ export class Assistant extends DurableObject<Env> {
 
 `PiHarness` is a Lifecycle capability, so it runs on a plain Durable Object. `Lifecycle.install(this)` gives the object its startup, alarms and job queue, and `.use(this.harness)` installs the harness on it. The object needs a SQLite migration in your Wrangler configuration, like any Durable Object that uses SQLite storage. To use it from an `Agent`, which already has a lifecycle, call `this.lifecycle.use(this.harness)` in the constructor instead.
 
-| Option     | What it is                                                                                                                                                                                                                                                                                                                          |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `harness`  | Required. Receives `{ storage, context, onWake }` and returns Pi's `Harness`, usually from `Harness.open`. Pass `onWake` to `Harness.open`, so the object can hibernate while Pi's tasks sleep (see [How recovery works](#how-recovery-works)). Models, the registry, `settings`, `env` and `onReport` are all yours to build here. |
-| `defaults` | What a new session starts with: `model`, a pi-ai `Model` such as `ai("@cf/…")`, `thinkingLevel`, and `maxTurns`, the most tool rounds one run takes before it ends unanswered (`turn_limit`). Without a model, a session's prompts end unanswered (`no_model`) until one is set.                                                    |
+| Option     | What it is                                                                                                                                                                                                                                                                                                                                    |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `harness`  | Required. Receives `{ storage, context, onWake, schedule }` and returns Pi's `Harness`, usually from `Harness.open`. Pass `onWake` to `Harness.open`, so the object can hibernate while Pi's tasks sleep (see [How recovery works](#how-recovery-works)). Models, the registry, `settings`, `env` and `onReport` are all yours to build here. |
+| `defaults` | What a new session starts with: `model`, a pi-ai `Model` such as `ai("@cf/…")`, `thinkingLevel`, and `maxTurns`, the most tool rounds one run takes before it ends unanswered (`turn_limit`). Without a model, a session's prompts end unanswered (`no_model`) until one is set.                                                              |
+| `runInRpc` | Optional. Dispatches Pi scheduler work through a native RPC on the same named root Durable Object. See [Trace Pi execution](#trace-pi-execution).                                                                                                                                                                                             |
 
 Create the registry per object, as the `registry` field above does, not at module scope: Pi keeps every `Harness` subscribed to its registry until the `Harness` closes, and an evicted object never closes it.
 
 The factory runs once per open: at startup, and again after a storage error (see [How recovery works](#how-recovery-works)), so keep it safe to run more than once. If it throws the operation that triggered it fails and the next operation tries again.
 
 A model in `defaults` or `session.setModel()` is stored by its provider and id only. Pi resolves it at each request against the `Models` the factory opened Pi with, so it must be a model those `Models` list. Options passed to `ai(id, options)` there, such as `fallback`, are not applied.
+
+## Trace Pi execution
+
+Enable Workers Tracing and configure `runInRpc` to keep the native Durable Object RPC open while Pi runs model and tool phases. This uses a private application binding to the same named root Durable Object that hosts the harness. The persistent Pi wake job still drives retries and recovery after eviction.
+
+This option requires a version of `@earendil-works/pi-durable` with an awaitable `HarnessOptions.schedule` hook. The `1.6.1` release lacks the hook. Use the standard harness configuration with that release.
+
+In the example above, bind the `Assistant` namespace as `PI_OBJECT` in Wrangler. Return the native same-object RPC promise from `runInRpc` and await `runScheduledWork()` in the receiving method. Forward both callbacks to Pi.
+
+```ts
+harness = new PiHarness({
+  runInRpc: (token) => {
+    const work = this.env.PI_OBJECT.get(this.ctx.id).runPiWork(token);
+    this.ctx.waitUntil(work.catch(() => {}));
+    return work;
+  },
+  harness: ({ storage, context, onWake, schedule }) => {
+    const models = createModels();
+    models.setProvider(this.ai.provider);
+    return Harness.open(
+      storage,
+      { models, registry: this.registry, onWake, schedule },
+      context
+    );
+  },
+  defaults: {
+    model: this.ai("@cf/deepseek-ai/deepseek-v4.1-flash-1017"),
+    thinkingLevel: "low"
+  }
+});
+
+async runPiWork(token: string): Promise<void> {
+  await this.harness.runScheduledWork(token);
+}
+```
+
+Startup holds the object's input gate. With `runInRpc` enabled, a startup hook can call `submit()` and keep the receipt or withdraw a queued operation with `abort({ operationId })`. Call `wait()` and `prompt()` after startup completes. Aborting a whole session, including an idle session, or aborting an operation that Pi has already placed also requires startup to finish. These calls reject during startup. Follow the same timing when calling Pi's raw APIs that wait for work to finish.
+
+Each execution RPC awaits Pi's scheduler passes and stays open while Pi has active work. When the work is idle or only has sleeping tasks, the RPC returns. The durable wake job handles timed sleeps and retries a dispatch that fails to reach the handler. If an invocation is interrupted, Pi recovers its work from SQLite on the next wake.
 
 ## Add tools and prompt sections
 

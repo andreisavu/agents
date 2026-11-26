@@ -2993,6 +2993,7 @@
     "PiHarness.prompt",
     "PiHarness.resetConversation",
     "PiHarness.root",
+    "PiHarness.runScheduledWork",
     "PiHarness.session",
     "PiHarness.sessions",
     "PiHarness.settled",

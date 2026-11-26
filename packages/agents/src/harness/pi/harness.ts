@@ -135,6 +135,11 @@ export type PiHarnessContext = {
    * `now` to `Harness.open`.
    */
   readonly onWake: (wake: Wake) => void;
+  /**
+   * Pass this to `Harness.open` as its `schedule` option when using
+   * `runInRpc`. Requires a pi-durable release that supports this option.
+   */
+  readonly schedule?: (run: () => Promise<void>) => void;
 };
 
 /**
@@ -200,6 +205,12 @@ export type PiHarnessOptions = {
   readonly harness: PiHarnessFactory;
   /** What a new session starts with. */
   readonly defaults?: PiSessionDefaults;
+  /**
+   * Return the native RPC promise for a call to this same named root Durable
+   * Object. Its handler must await `runScheduledWork(token)`. Forward
+   * `schedule` and `onWake` to a pi-durable version that supports both.
+   */
+  readonly runInRpc?: (token: string) => Promise<void>;
 };
 
 /**
@@ -227,9 +238,28 @@ export type PiRootResult = {
   readonly created: boolean;
 };
 
+/** A dispatch only owns work queued by its own open Pi instance. */
+type RpcDispatch = {
+  readonly token: string;
+  entered: boolean;
+  readonly enterBy: number;
+  readonly expire: () => void;
+};
+
+type RpcExecution = {
+  readonly invoke: NonNullable<PiHarnessOptions["runInRpc"]>;
+  readonly pending: Array<() => Promise<void>>;
+  ready: boolean;
+  closed: boolean;
+  retryAt: number;
+  dispatch?: RpcDispatch;
+  changed?: () => void;
+};
+
 type Opened = {
   readonly pi: Harness;
   readonly storage: SqliteStorage;
+  readonly rpc?: RpcExecution;
 };
 
 /** pi-durable's stored reference to a pi-ai model. */
@@ -295,7 +325,7 @@ export class PiHarness extends LifecycleCapability {
   #heartbeatMs = HEARTBEAT_MS;
   #pollMs = POLL_MS;
   #opening: Promise<Opened> | undefined;
-  /** Settles once the last pi that closed on its own has closed. */
+  /** Completion barrier for the previous Pi instance, including failed closes. */
   #lastClose: Promise<unknown> = Promise.resolve();
   /** Every pi that has begun closing, on its own or by `dispose()`. */
   readonly #closing = new WeakSet<Harness>();
@@ -324,6 +354,11 @@ export class PiHarness extends LifecycleCapability {
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
   override async onStart(_context: CapabilityStartContext): Promise<void> {
+    if (this.#options.runInRpc && this.lifecycle.routes.source) {
+      throw new Error(
+        "PiHarness.runInRpc requires a named root Durable Object"
+      );
+    }
     await this.#open();
   }
 
@@ -375,10 +410,18 @@ export class PiHarness extends LifecycleCapability {
   /** Close pi's in-memory resources. Durable state is untouched. */
   async dispose(): Promise<void> {
     const opening = this.#opening;
+    if (!opening) {
+      await this.#lastClose;
+      return;
+    }
     this.#opening = undefined;
-    const opened = await opening?.catch(() => undefined);
-    // Closing calls #piClosing, which also ends a wait sleeping on this pi.
-    await opened?.pi.close(BG);
+    // Publish the close before a concurrent open can reach the same storage.
+    const closing = opening.then(
+      ({ pi }) => pi.close(BG),
+      () => {}
+    );
+    this.#lastClose = closing.catch(() => {});
+    await closing;
   }
 
   // ── The harness interface ────────────────────────────────────────────────
@@ -635,6 +678,7 @@ export class PiHarness extends LifecycleCapability {
    * the wake is scheduled first.
    */
   async abortConversation(session: PiSessionId): Promise<void> {
+    await this.readyToWait();
     const conversation = await this.conversation(session);
     await this.#admit(() => conversation.abort(BG));
   }
@@ -651,12 +695,26 @@ export class PiHarness extends LifecycleCapability {
     await this.#admit(() => conversation.reset(handoff, BG));
   }
 
+  /** @internal Reject a wait that would hold the startup gate closed. */
+  async readyToWait(): Promise<void> {
+    if (!this.#options.runInRpc) return;
+    await this.lifecycle.ready();
+    if (this.lifecycle.status() !== "started") {
+      throw new Error(
+        "PiHarness cannot wait for work during startup with runInRpc. " +
+          "Submit during startup or withdraw queued operations by id. " +
+          "Wait for receipts or abort a session after startup."
+      );
+    }
+  }
+
   /** @internal Wait for pi to settle an operation, by its request id. */
   async settled(
     session: PiSessionId,
     operationId: string,
     signal?: AbortSignal
   ): Promise<PiOperationResult> {
+    await this.readyToWait();
     const conversation = await this.conversation(session);
     const context = signalContext(signal);
     const submission = await this.#findSubmission(
@@ -742,7 +800,8 @@ export class PiHarness extends LifecycleCapability {
   async #wakeStep(): Promise<LifecycleJobOutcome> {
     const heartbeat = { rescheduleAt: Date.now() + this.#heartbeatMs };
     if (this.#waiting) return heartbeat;
-    const { pi } = await this.#open();
+    const { pi, rpc } = await this.#open();
+    if (rpc) return this.#wakeRpc(pi, rpc);
     // The alarm may be for a sleeping task: make due ones runnable.
     pi.resume();
     const wake = pi.wake();
@@ -828,6 +887,186 @@ export class PiHarness extends LifecycleCapability {
     }
   }
 
+  /** The usual durable wake retries an RPC or picks up Pi after eviction. */
+  async #wakeRpc(pi: Harness, rpc: RpcExecution): Promise<LifecycleJobOutcome> {
+    const now = Date.now();
+    const dispatch = rpc.dispatch;
+    if (dispatch && !dispatch.entered && dispatch.enterBy <= now) {
+      dispatch.expire();
+      await this.#retryRpc(
+        rpc,
+        dispatch,
+        new Error("Pi execution RPC did not enter before the heartbeat")
+      );
+    }
+    if (rpc.retryAt > now) return { rescheduleAt: rpc.retryAt };
+    const heartbeat = { rescheduleAt: now + this.#heartbeatMs };
+    if (rpc.closed) return undefined;
+    if (rpc.dispatch) {
+      // A due sleep may already have disappeared from wake.at when the RPC
+      // notices it. The heartbeat also gives Pi a chance to promote it.
+      if (rpc.dispatch.entered) pi.resume();
+      return heartbeat;
+    }
+
+    const wake = pi.wake();
+    if (wake.active || (wake.at !== undefined && wake.at <= now)) pi.resume();
+    this.#dispatchRpc(rpc);
+    if (rpc.dispatch || this.#admitting > 0) return heartbeat;
+    if (wake.at !== undefined) return { rescheduleAt: wake.at };
+  }
+
+  /** Start the RPC from admission as well as the alarm, since host alarm code
+   * may itself wait for Pi. The first startup leaves its work to the alarm
+   * or to the next request after the input gate opens. */
+  #dispatchRpc(rpc: RpcExecution): void {
+    if (
+      !rpc.ready ||
+      rpc.closed ||
+      rpc.dispatch ||
+      rpc.pending.length === 0 ||
+      rpc.retryAt > Date.now() ||
+      this.lifecycle.status() !== "started"
+    )
+      return;
+
+    let expire!: () => void;
+    const expired = new Promise<void>((resolve) => {
+      expire = resolve;
+    });
+    const dispatch: RpcDispatch = {
+      token: crypto.randomUUID(),
+      entered: false,
+      enterBy: Date.now() + this.#heartbeatMs,
+      expire
+    };
+    rpc.dispatch = dispatch;
+    // An unclaimed call may never settle. Once the receiver enters, track
+    // the native transport through its normal completion.
+    const work = Promise.race([this.#invokeRpc(rpc, dispatch), expired]);
+    if (!this.lifecycle.trackAlarmWork(work)) {
+      work.catch((error: unknown) => this.#wakeError(error));
+    }
+  }
+
+  async #invokeRpc(rpc: RpcExecution, dispatch: RpcDispatch): Promise<void> {
+    try {
+      await rpc.invoke(dispatch.token);
+      if (!dispatch.entered && rpc.dispatch === dispatch) {
+        throw new Error(
+          "Pi execution RPC did not enter runScheduledWork on this object"
+        );
+      }
+    } catch (error) {
+      if (!dispatch.entered) {
+        if (rpc.dispatch !== dispatch) return;
+        await this.#retryRpc(rpc, dispatch, error);
+      }
+      // An entered receiver finishes work independently of its sender.
+      if (isDurableObjectMemoryLimitReset(error)) throw error;
+    }
+  }
+
+  async #retryRpc(
+    rpc: RpcExecution,
+    dispatch: RpcDispatch,
+    error: unknown
+  ): Promise<void> {
+    if (rpc.closed || rpc.dispatch !== dispatch) return;
+    rpc.dispatch = undefined;
+    rpc.changed?.();
+    rpc.changed = undefined;
+    rpc.retryAt = Date.now() + this.#heartbeatMs;
+    this.#wakeError(error);
+    await this.#wake(rpc.retryAt);
+  }
+
+  /**
+   * Await this in the native RPC handler for `runInRpc`. Each token is
+   * valid only on the open harness that issued it and can be entered once.
+   */
+  async runScheduledWork(token: string): Promise<void> {
+    const opened = await this.#opening;
+    const rpc = opened?.rpc;
+    const dispatch = rpc?.dispatch;
+    if (
+      !opened ||
+      !rpc ||
+      rpc.closed ||
+      !dispatch ||
+      dispatch.token !== token ||
+      dispatch.entered
+    )
+      return;
+    dispatch.entered = true;
+    try {
+      await this.#runRpcWork(opened.pi, rpc, dispatch);
+    } catch (error) {
+      if (isDurableObjectMemoryLimitReset(error)) {
+        // Preserve the platform's failure classification across native RPC
+        // serialization, which can omit the original error's cause.
+        throw new Error("Pi Durable Object exceeded its memory limit", {
+          cause: error
+        });
+      }
+      await this.#retryRpc(rpc, dispatch, error);
+      throw error;
+    } finally {
+      if (rpc.dispatch === dispatch) {
+        rpc.dispatch = undefined;
+        if (!rpc.closed) await this.#wake();
+      }
+    }
+  }
+
+  async #runRpcWork(
+    pi: Harness,
+    rpc: RpcExecution,
+    dispatch: RpcDispatch
+  ): Promise<void> {
+    while (rpc.dispatch === dispatch) {
+      if (rpc.closed) {
+        // Keep the native RPC open while Pi joins aborting tasks and closes
+        // storage. Report a memory-limit reset in the alarm's domain.
+        const end = await pi.closed;
+        if (
+          end.kind === "failed" &&
+          isDurableObjectMemoryLimitReset(end.error)
+        ) {
+          throw end.error;
+        }
+        return;
+      }
+      const run = rpc.pending.shift();
+      if (run) {
+        // Pi's pass may have committed a reservation before its task counts
+        // as active. Only observe wake/idle once the pass has finished.
+        await run();
+        continue;
+      }
+      const wake = pi.wake();
+      if (!wake.active) return;
+      const sleep = Math.min(
+        this.#heartbeatMs,
+        (wake.at ?? Infinity) - Date.now()
+      );
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, sleep);
+        rpc.changed = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      if (rpc.dispatch !== dispatch) return;
+      rpc.changed = undefined;
+      // Pi stops reporting a sleep in `at` once it is due, so use the
+      // timestamp this wait actually observed.
+      if (!rpc.closed && wake.at !== undefined && Date.now() >= wake.at) {
+        pi.resume();
+      }
+    }
+  }
+
   #wakeError(error: unknown): void {
     this.lifecycle.events.emit("pi:wake_error", {
       error: error instanceof Error ? error.message : String(error)
@@ -861,7 +1100,9 @@ export class PiHarness extends LifecycleCapability {
       });
       this.#opening = opening;
     }
-    return this.#opening;
+    const opened = await this.#opening;
+    if (opened.rpc) this.#dispatchRpc(opened.rpc);
+    return opened;
   }
 
   async #doOpen(
@@ -872,25 +1113,72 @@ export class PiHarness extends LifecycleCapability {
     // database.
     await this.#lastClose;
     const storage = await openPiSessionStore(this.lifecycle.storage);
-    const pi = await this.#options.harness({
-      storage,
-      context: BG,
-      onWake: this.#onWake
-    });
+    const invoke = this.#options.runInRpc;
+    const rpc: RpcExecution | undefined = invoke
+      ? { invoke, pending: [], ready: false, closed: false, retryAt: 0 }
+      : undefined;
+    let pi: Harness | undefined;
+    let rpcWakeWired = false;
     try {
+      pi = await this.#options.harness({
+        storage,
+        context: BG,
+        onWake: rpc
+          ? (wake) => {
+              if (rpc.closed) return;
+              rpcWakeWired = true;
+              rpc.changed?.();
+              this.#wakeFor(wake).catch((error: unknown) =>
+                this.#wakeError(error)
+              );
+            }
+          : this.#onWake,
+        schedule: rpc
+          ? (run) => {
+              if (rpc.closed) return;
+              rpc.pending.push(run);
+              rpc.changed?.();
+              this.#dispatchRpc(rpc);
+            }
+          : undefined
+      });
       const closed = pi.closed;
       // Called synchronously when pi begins closing, unlike `closed`, so a
       // closed pi is never handed out. It must not call pi.
-      pi.subscribeClose(() => onClose(pi, closed));
+      const openedPi = pi;
+      pi.subscribeClose(() => {
+        if (rpc) {
+          rpc.closed = true;
+          rpc.pending.length = 0;
+          const dispatch = rpc.dispatch;
+          if (dispatch && !dispatch.entered) {
+            rpc.dispatch = undefined;
+            dispatch.expire();
+          }
+          rpc.changed?.();
+        }
+        onClose(openedPi, closed);
+      });
       // Opening creates no conversation: the root's first use creates it
       // (see `conversation()`), so `root()` can seed it.
       // Continue whatever the last pi left, in this isolate or the last one:
       // pi reconciles tasks that were running to pending and schedules them
       // again.
       pi.resume();
+      if (rpc && rpc.pending.length === 0) {
+        throw new Error(
+          "PiHarness.runInRpc requires a pi-durable version with the schedule hook. " +
+            "Pass schedule from the PiHarness factory to Harness.open."
+        );
+      }
       // pi calls onWake right after open, from a microtask.
       await new Promise((resolve) => setTimeout(resolve, 0));
-      if (!this.#onWakeWired) {
+      if (rpc && !rpcWakeWired) {
+        throw new Error(
+          "PiHarness.runInRpc requires forwarding onWake to Harness.open"
+        );
+      }
+      if (!rpc && !this.#onWakeWired) {
         console.warn(
           "PiHarness: the harness factory did not pass onWake to Harness.open, " +
             "so pi's timers keep this Durable Object in memory while a task " +
@@ -901,14 +1189,21 @@ export class PiHarness extends LifecycleCapability {
       // Whatever the last pi left gets a wake, including work whose wake
       // failed out. With `onWake`, pi has already said so; this covers a
       // factory without it. The job id is fixed, so this is idempotent.
-      await this.#wakeFor(pi.wake());
+      if (rpc) {
+        // Even an idle wake may have a first pass to abandon restart-only
+        // tasks. Persist its wake before letting any RPC consume that pass.
+        await this.#wake();
+        rpc.ready = true;
+      } else {
+        await this.#wakeFor(pi.wake());
+      }
     } catch (error) {
-      // pi is open and running its tasks: close it, so the next open does
-      // not start a second pi over the same database beside it.
-      pi.close(BG).catch(() => {});
+      // Close a Pi the factory returned before letting another open beside it.
+      if (rpc) rpc.closed = true;
+      await pi?.close(BG).catch(() => {});
       throw error;
     }
-    return { pi, storage };
+    return { pi, storage, rpc };
   }
 
   /**
@@ -1019,6 +1314,7 @@ export class PiSession {
     input: UserInput,
     options: PiSubmitOptions = {}
   ): Promise<PiPromptResponse> {
+    await this.#harness.readyToWait();
     const receipt = await this.submit(input, options);
     const result = await this.wait(receipt.operationId);
     return { ...result, messages: await this.messages() };
@@ -1049,6 +1345,7 @@ export class PiSession {
    * Withdraw one queued operation (or abort the run it joined), or, with no
    * id, abort the session: pi withdraws queued inputs, apart from those
    * submitted with `onAbort: "keep"`, and aborts the running work.
+   * With `runInRpc`, only queued operations can be withdrawn during startup.
    */
   async abort(operationId?: string): Promise<boolean> {
     if (operationId !== undefined) {
